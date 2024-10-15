@@ -173,7 +173,7 @@ async fn subscribe_to_channel(
     db: &Db,
     dst: &mut Connection,
 ) -> crate::Result<()> {
-    let mut rx = db.subscribe(channel_name.clone());
+    let mut rx = db.subscribe(channel_name.clone()).await;
 
     // Subscribe to the channel.
     let rx = Box::pin(async_stream::stream! {

@@ -3,8 +3,15 @@ use tokio::time::{self, Duration, Instant};
 
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::debug;
+
+use object_store::{memory::InMemory, path::Path, ObjectStore};
+use slatedb::config::DbOptions;
+use slatedb::db::Db as SlateDb;
+use std::convert::TryInto;
+use std::fmt::Debug;
 
 /// A wrapper around a `Db` instance. This exists to allow orderly cleanup
 /// of the `Db` by signalling the background purge task to shut down when
@@ -57,11 +64,21 @@ struct Shared {
     background_task: Notify,
 }
 
+// Implement Debug for SlateDb using a newtype pattern
+struct KvStore(SlateDb);
+
+impl Debug for KvStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KvStore")
+    }
+}
+
 #[derive(Debug)]
 struct State {
-    /// The key-value data. We are not trying to do anything fancy so a
-    /// `std::collections::HashMap` works fine.
-    entries: HashMap<String, Entry>,
+    // /// The key-value data. We are not trying to do anything fancy so a
+    // /// `std::collections::HashMap` works fine.
+    // entries: HashMap<String, Entry>,
+    kv_store: KvStore,
 
     /// The pub/sub key-space. Redis uses a **separate** key space for key-value
     /// and pub/sub. `mini-redis` handles this by using a separate `HashMap`.
@@ -96,11 +113,49 @@ struct Entry {
     expires_at: Option<Instant>,
 }
 
+impl Entry {
+    fn encode(&self) -> Bytes {
+        let mut buf = Vec::with_capacity(8 + self.data.len());
+
+        match self.expires_at {
+            Some(instant) => {
+                let duration = instant.duration_since(Instant::now());
+                buf.extend_from_slice(&duration.as_secs().to_be_bytes());
+            }
+            None => buf.extend_from_slice(&[0xFF; 8]),
+        }
+
+        buf.extend_from_slice(&self.data);
+        Bytes::from(buf)
+    }
+
+    fn decode(bytes: Bytes) -> Option<Self> {
+        if bytes.len() < 8 {
+            return None;
+        }
+
+        let (expires_at_bytes, data) = bytes.split_at(8);
+        let expires_at = if expires_at_bytes == [0xFF; 8] {
+            None
+        } else {
+            let secs = u64::from_be_bytes(expires_at_bytes.try_into().unwrap());
+            Some(Instant::now() + Duration::from_secs(secs))
+        };
+
+        Some(Entry {
+            data: Bytes::from(data.to_vec()),
+            expires_at,
+        })
+    }
+}
+
 impl DbDropGuard {
     /// Create a new `DbDropGuard`, wrapping a `Db` instance. When this is dropped
     /// the `Db`'s purge task will be shut down.
-    pub(crate) fn new() -> DbDropGuard {
-        DbDropGuard { db: Db::new() }
+    pub(crate) async fn new() -> DbDropGuard {
+        DbDropGuard {
+            db: Db::new().await,
+        }
     }
 
     /// Get the shared database. Internally, this is an
@@ -120,10 +175,18 @@ impl Drop for DbDropGuard {
 impl Db {
     /// Create a new, empty, `Db` instance. Allocates shared state and spawns a
     /// background task to manage key expiration.
-    pub(crate) fn new() -> Db {
+    pub(crate) async fn new() -> Db {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let options = DbOptions::default();
+        let kv_store =
+            SlateDb::open_with_opts(Path::from("/tmp/test_kv_store"), options, object_store)
+                .await
+                .unwrap();
+
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                entries: HashMap::new(),
+                // entries: HashMap::new(),
+                kv_store: KvStore(kv_store),
                 pub_sub: HashMap::new(),
                 expirations: BTreeSet::new(),
                 shutdown: false,
@@ -142,21 +205,34 @@ impl Db {
     /// Returns `None` if there is no value associated with the key. This may be
     /// due to never having assigned a value to the key or a previously assigned
     /// value expired.
-    pub(crate) fn get(&self, key: &str) -> Option<Bytes> {
+    pub(crate) async fn get(&self, key: &str) -> Option<Bytes> {
         // Acquire the lock, get the entry and clone the value.
         //
         // Because data is stored using `Bytes`, a clone here is a shallow
         // clone. Data is not copied.
-        let state = self.shared.state.lock().unwrap();
-        state.entries.get(key).map(|entry| entry.data.clone())
+        let state = self.shared.state.lock().await;
+        let bytes = state.kv_store.0.get(key.as_bytes()).await.ok()??;
+
+        let entry = Entry::decode(bytes)?;
+
+        // Check if the entry has expired
+        if let Some(expires_at) = entry.expires_at {
+            if Instant::now() > expires_at {
+                return None;
+            }
+        }
+
+        Some(entry.data)
+
+        // state.entries.get(key).map(|entry| entry.data.clone())
     }
 
     /// Set the value associated with a key along with an optional expiration
     /// Duration.
     ///
     /// If a value is already associated with the key, it is removed.
-    pub(crate) fn set(&self, key: String, value: Bytes, expire: Option<Duration>) {
-        let mut state = self.shared.state.lock().unwrap();
+    pub(crate) async fn set(&self, key: String, value: Bytes, expire: Option<Duration>) {
+        let mut state = self.shared.state.lock().await;
 
         // If this `set` becomes the key that expires **next**, the background
         // task needs to be notified so it can update its state.
@@ -180,20 +256,31 @@ impl Db {
             when
         });
 
-        // Insert the entry into the `HashMap`.
-        let prev = state.entries.insert(
-            key.clone(),
-            Entry {
-                data: value,
-                expires_at,
-            },
-        );
+        let encoded_entry = Entry {
+            data: value,
+            expires_at,
+        }
+        .encode();
+
+        let prev = state.kv_store.0.get(key.as_bytes()).await.unwrap();
+
+        state.kv_store.0.put(key.as_bytes(), &encoded_entry).await;
+
+        // // Insert the entry into the `HashMap`.
+        // let prev = state.entries.insert(
+        //     key.clone(),
+        //     Entry {
+        //         data: value,
+        //         expires_at,
+        //     },
+        // );
 
         // If there was a value previously associated with the key **and** it
         // had an expiration time. The associated entry in the `expirations` map
         // must also be removed. This avoids leaking data.
         if let Some(prev) = prev {
-            if let Some(when) = prev.expires_at {
+            let prev_entry = Entry::decode(prev).unwrap();
+            if let Some(when) = prev_entry.expires_at {
                 // clear expiration
                 state.expirations.remove(&(when, key.clone()));
             }
@@ -222,11 +309,11 @@ impl Db {
     ///
     /// The returned `Receiver` is used to receive values broadcast by `PUBLISH`
     /// commands.
-    pub(crate) fn subscribe(&self, key: String) -> broadcast::Receiver<Bytes> {
+    pub(crate) async fn subscribe(&self, key: String) -> broadcast::Receiver<Bytes> {
         use std::collections::hash_map::Entry;
 
         // Acquire the mutex
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.state.lock().await;
 
         // If there is no entry for the requested channel, then create a new
         // broadcast channel and associate it with the key. If one already
@@ -253,8 +340,8 @@ impl Db {
 
     /// Publish a message to the channel. Returns the number of subscribers
     /// listening on the channel.
-    pub(crate) fn publish(&self, key: &str, value: Bytes) -> usize {
-        let state = self.shared.state.lock().unwrap();
+    pub(crate) async fn publish(&self, key: &str, value: Bytes) -> usize {
+        let state = self.shared.state.lock().await;
 
         state
             .pub_sub
@@ -270,10 +357,10 @@ impl Db {
 
     /// Signals the purge background task to shut down. This is called by the
     /// `DbShutdown`s `Drop` implementation.
-    fn shutdown_purge_task(&self) {
+    async fn shutdown_purge_task(&self) {
         // The background task must be signaled to shut down. This is done by
         // setting `State::shutdown` to `true` and signalling the task.
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.state.lock().await;
         state.shutdown = true;
 
         // Drop the lock before signalling the background task. This helps
@@ -287,8 +374,8 @@ impl Db {
 impl Shared {
     /// Purge all expired keys and return the `Instant` at which the **next**
     /// key will expire. The background task will sleep until this instant.
-    fn purge_expired_keys(&self) -> Option<Instant> {
-        let mut state = self.state.lock().unwrap();
+    async fn purge_expired_keys(&self) -> Option<Instant> {
+        let mut state = self.state.lock().await;
 
         if state.shutdown {
             // The database is shutting down. All handles to the shared state
@@ -314,7 +401,8 @@ impl Shared {
             }
 
             // The key expired, remove it
-            state.entries.remove(key);
+            // state.entries.remove(key);
+            state.kv_store.0.delete(key.as_bytes()).await;
             state.expirations.remove(&(when, key.clone()));
         }
 
@@ -325,8 +413,8 @@ impl Shared {
     ///
     /// The `shutdown` flag is set when all `Db` values have dropped, indicating
     /// that the shared state can no longer be accessed.
-    fn is_shutdown(&self) -> bool {
-        self.state.lock().unwrap().shutdown
+    async fn is_shutdown(&self) -> bool {
+        self.state.lock().await.shutdown
     }
 }
 
@@ -345,11 +433,11 @@ impl State {
 /// state handle. If `shutdown` is set, terminate the task.
 async fn purge_expired_tasks(shared: Arc<Shared>) {
     // If the shutdown flag is set, then the task should exit.
-    while !shared.is_shutdown() {
+    while !shared.is_shutdown().await {
         // Purge all keys that are expired. The function returns the instant at
         // which the **next** key will expire. The worker should wait until the
         // instant has passed then purge again.
-        if let Some(when) = shared.purge_expired_keys() {
+        if let Some(when) = shared.purge_expired_keys().await {
             // Wait until the next key expires **or** until the background task
             // is notified. If the task is notified, then it must reload its
             // state as new keys have been set to expire early. This is done by

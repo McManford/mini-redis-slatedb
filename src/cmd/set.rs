@@ -127,7 +127,7 @@ impl Set {
     #[instrument(skip(self, db, dst))]
     pub(crate) async fn apply(self, db: &Db, dst: &mut Connection) -> crate::Result<()> {
         // Set the value in the shared database state.
-        db.set(self.key, self.value, self.expire);
+        db.set(self.key, self.value, self.expire).await;
 
         // Create a success response and write it to `dst`.
         let response = Frame::Simple("OK".to_string());

@@ -37,10 +37,17 @@ tracing-opentelemetry = { version = "0.21.0", optional = true }
 opentelemetry-aws = { version = "0.8.0", optional = true }
 # Allows you to send data to the OTel collector
 opentelemetry-otlp = { version = "0.13.0", optional = true }
+slatedb = "*"
+object_store = "*"
 
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.
 tokio = { version = "1", features = ["test-util"] }
 
 [features]
-otel = ["dep:opentelemetry", "dep:tracing-opentelemetry", "dep:opentelemetry-aws", "dep:opentelemetry-otlp"]
+otel = [
+    "dep:opentelemetry",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry-aws",
+    "dep:opentelemetry-otlp",
+]
